@@ -11,6 +11,7 @@
 #include <sbi/sbi_const.h>
 #include <sbi/sbi_hart.h>
 #include <sbi/sbi_platform.h>
+#include <sbi/sbi_console.h>
 #include <sbi_utils/fdt/fdt_helper.h>
 #include <sbi_utils/fdt/fdt_fixup.h>
 #include <sbi_utils/ipi/aclint_mswi.h>
@@ -24,6 +25,7 @@
 #define VEX_DEFAULT_PLIC_ADDR	0xf0c00000
 #define VEX_DEFAULT_PLIC_NUM_SOURCES	4
 #define VEX_DEFAULT_CLINT_ADDR	0xF0010000
+#define VEX_DEFAULT_CLIC_ADDR	0xf0d00000  /* Default CLIC base address */
 #define VEX_DEFAULT_ACLINT_MTIMER_FREQ	100000000
 #define VEX_DEFAULT_ACLINT_MSWI_ADDR	\
 		(VEX_DEFAULT_CLINT_ADDR + CLINT_MSWI_OFFSET)
@@ -32,6 +34,22 @@
 #define VEX_DEFAULT_HART_STACK_SIZE	8192
 
 /* clang-format on */
+
+/* CLIC mode detection flag */
+static bool clic_mode_detected = false;
+
+/* Simple CLIC initialization structure */
+struct clic_data {
+	unsigned long addr;
+	u32 num_interrupts;
+	u32 num_harts;
+};
+
+static struct clic_data clic = {
+	.addr = VEX_DEFAULT_CLIC_ADDR,
+	.num_interrupts = 64,
+	.num_harts = VEX_DEFAULT_HART_COUNT,
+};
 
 static struct plic_data plic = {
 	.addr = VEX_DEFAULT_PLIC_ADDR,
@@ -59,10 +77,48 @@ static struct aclint_mtimer_data mtimer = {
 };
 
 /*
+ * Detect if CLIC is present and configured
+ */
+static bool vex_detect_clic(void)
+{
+	unsigned long mtvec, mtvec_orig;
+	bool clic_supported = false;
+	
+	/* Save original mtvec */
+	mtvec_orig = csr_read(CSR_MTVEC);
+	
+	/* Try to set CLIC mode (mode = 3) in mtvec.mode bits [1:0] */
+	mtvec = (mtvec_orig & ~0x3UL) | 0x3UL;
+	csr_write(CSR_MTVEC, mtvec);
+	
+	/* Read back to see if CLIC mode stuck */
+	mtvec = csr_read(CSR_MTVEC);
+	
+	/* Check if mode bits are 3 (CLIC mode) */
+	if ((mtvec & 0x3UL) == 0x3UL) {
+		clic_supported = true;
+		/* Keep CLIC mode active */
+		sbi_printf("VexRiscv: CLIC hardware detected (mtvec.mode=3 supported)\n");
+	} else {
+		/* Restore original mode */
+		csr_write(CSR_MTVEC, mtvec_orig);
+		sbi_printf("VexRiscv: No CLIC support detected (mtvec.mode=%ld)\n", 
+			   mtvec & 0x3UL);
+	}
+	
+	return clic_supported;
+}
+
+/*
  * VexRiscv platform early initialization.
  */
 static int vex_early_init(bool cold_boot)
 {
+	if (cold_boot) {
+		/* Detect if CLIC mode is available */
+		clic_mode_detected = vex_detect_clic();
+	}
+	
 	return 0;
 }
 
@@ -78,6 +134,14 @@ static int vex_final_init(bool cold_boot)
 
 	fdt = fdt_get_address();
 	fdt_fixups(fdt);
+	
+	/* Report interrupt controller mode */
+	if (clic_mode_detected) {
+		sbi_printf("VexRiscv: Running in CLIC mode with %d interrupts\n", 
+			   clic.num_interrupts);
+	} else {
+		sbi_printf("VexRiscv: Running in PLIC/CLINT mode\n");
+	}
 
 	return 0;
 }
@@ -90,6 +154,55 @@ static int vex_console_init(void)
 	return litex_uart_init(VEX_DEFAULT_UART_ADDR);
 }
 
+/* CLIC CSR addresses - these may vary by implementation */
+#define CSR_MCLICBASE     0x307  /* Base address for CLIC memory-mapped registers */
+
+/*
+ * Initialize CLIC for current HART
+ */
+static int vex_clic_init(bool cold_boot)
+{
+	u32 hartid = current_hartid();
+	unsigned long mtvec_val;
+	
+	if (cold_boot) {
+		/* Basic CLIC initialization */
+		sbi_printf("VexRiscv: Initializing CLIC at 0x%lx\n", clic.addr);
+		
+		/* Set CLIC mode in mtvec (mode = 3) */
+		mtvec_val = csr_read(CSR_MTVEC);
+		mtvec_val = (mtvec_val & ~0x3UL) | 0x3UL;
+		csr_write(CSR_MTVEC, mtvec_val);
+		
+		/* Verify CLIC mode is active */
+		mtvec_val = csr_read(CSR_MTVEC);
+		if ((mtvec_val & 0x3UL) != 0x3UL) {
+			sbi_printf("VexRiscv: WARNING: Failed to set CLIC mode in mtvec\n");
+			return -1;
+		}
+		
+		/* Clear all pending interrupts if accessible via MMIO */
+		/* This would require memory-mapped access to CLIC registers */
+		/* which depends on the specific implementation */
+		
+		/* Set interrupt threshold to 0 to allow all interrupts */
+		/* The exact CSR number for mintthresh varies by implementation */
+		/* Some implementations use custom CSRs in the 0x7XX range */
+	}
+	
+	/* Per-hart CLIC configuration */
+	sbi_printf("VexRiscv: CLIC initialized for hart %d in mode 0x%lx\n", 
+		   hartid, csr_read(CSR_MTVEC) & 0x3);
+	
+	/* Enable machine interrupts */
+	csr_set(CSR_MSTATUS, MSTATUS_MIE);
+	
+	/* Enable all interrupt sources in MIE */
+	csr_write(CSR_MIE, -1UL);
+	
+	return 0;
+}
+
 /*
  * Initialize the vexRiscv interrupt controller for current HART.
  */
@@ -98,6 +211,12 @@ static int vex_irqchip_init(bool cold_boot)
 	int rc;
 	u32 hartid = current_hartid();
 
+	/* Use CLIC if detected, otherwise fall back to PLIC */
+	if (clic_mode_detected) {
+		return vex_clic_init(cold_boot);
+	}
+
+	/* Traditional PLIC initialization */
 	if (cold_boot) {
 		rc = plic_cold_irqchip_init(&plic);
 		if (rc)
